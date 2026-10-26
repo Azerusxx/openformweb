@@ -1,0 +1,84 @@
+name: Build actual openForm web app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-webapp.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required access
+        env:
+          SOURCE_TOKEN: ${{ secrets.OPENFORM_SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::Add OPENFORM_SOURCE_TOKEN as a repository Actions secret. It needs read-only Contents permission on Azerusxx/openForm."
+            exit 1
+          fi
+      - name: Checkout public deployment repository
+        uses: actions/checkout@v4
+        with:
+          path: site
+          persist-credentials: true
+      - name: Checkout private app source
+        uses: actions/checkout@v4
+        with:
+          repository: Azerusxx/openForm
+          token: ${{ secrets.OPENFORM_SOURCE_TOKEN }}
+          ref: main
+          path: source
+          persist-credentials: false
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: source/frontend/package-lock.json
+      - name: Disable demo fixture data but preserve offline guest mode
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          f = Path("source/frontend/src/store/useStore.js")
+          s = f.read_text()
+          before = """        if (!localStorage.getItem(DEMO_SEEDED)) {
+                    localStorage.setItem(DEMO_SEEDED, '1')
+                    await get().resetDemo()
+                  }"""
+          import re
+          s, count = re.subn(r"        if \(!localStorage\.getItem\(DEMO_SEEDED\)\) \{\s*localStorage\.setItem\(DEMO_SEEDED, '1'\)\s*await get\(\)\.resetDemo\(\)\s*\}", "        // openForm web: empty local profile, no example records", s, count=1)
+          if count != 1:
+            raise SystemExit("Demo bootstrap changed; refusing unsafe patch")
+          f.write_text(s)
+          PY
+      - name: Install dependencies
+        working-directory: source/frontend
+        run: npm ci
+      - name: Build real app for static hosting
+        working-directory: source/frontend
+        env:
+          VITE_DEMO: '1'
+        run: npm run build
+      - name: Publish compiled assets only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s source/frontend/dist/index.html
+          # Keep deployment workflow and public repository metadata; only publish compiled files.
+          find site -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.github' -exec rm -rf {} +
+          cp -a source/frontend/dist/. site/
+          touch site/.nojekyll
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "deploy: update compiled openForm web app"
+            git push origin HEAD:main
+          fi
